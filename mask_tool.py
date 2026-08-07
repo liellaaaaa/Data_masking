@@ -20,6 +20,7 @@ import io
 import re
 import hashlib
 import base64
+from collections import defaultdict
 from datetime import datetime
 
 # cryptography(Fernet) 为可选依赖：仅用于"加密映射表"功能。
@@ -92,8 +93,9 @@ MASK_RULES = {
     '邮件': {'func': lambda: get_fake().email(), 'label': '邮箱'},
     '公司': {'func': lambda: get_fake().company(), 'label': '公司名'},
     '账号': {'func': lambda: get_fake().credit_card_number(), 'label': '银行卡号'},
-    '薪资': {'func': lambda: get_fake().credit_card_number(), 'label': '银行卡号'},
-    '工资': {'func': lambda: get_fake().credit_card_number(), 'label': '银行卡号'},
+    '金额': {'func': lambda: None, 'label': '金额(保留格式)'},
+    '薪资': {'func': lambda: None, 'label': '金额(保留格式)'},
+    '工资': {'func': lambda: None, 'label': '金额(保留格式)'},
     '发票': {'func': lambda: get_fake().random_number(digits=20), 'label': '随机数字'},
     '税号': {'func': lambda: get_fake().random_number(digits=18), 'label': '随机数字'},
     '编号': {'func': lambda: get_fake().random_number(digits=10), 'label': '随机数字'},
@@ -110,6 +112,7 @@ MASK_METHODS = {
     '公司名': {'label': '公司名', 'description': '生成公司名称'},
     '自定义文本': {'label': '自定义文本', 'description': '生成自定义文本'},
     '随机数字': {'label': '随机数字', 'description': '生成随机数字，保持原格式'},
+    '金额(保留格式)': {'label': '金额(保留格式)', 'description': '随机金额，保留小数位/千分位/负号格式'},
     '部分遮蔽(保留前3位)': {'label': '部分遮蔽(保留前3位)', 'description': '保留前3位，其余用*替换'},
     '完全遮蔽': {'label': '完全遮蔽', 'description': '全部用*替换'},
     '保留格式遮蔽': {'label': '保留格式遮蔽', 'description': '保留数字格式，替换为随机数字'},
@@ -143,6 +146,78 @@ def keep_long_numbers_as_text(df):
     return df
 
 
+def clean_column_names(cols):
+    """清洗列名：去掉空白/BOM；空名与 Unnamed 改为「列N」；重名追加 _2/_3。
+
+    解决 A1 空置或全空列时 pandas 生成 Unnamed: N 的问题，
+    让表头对用户可读、可勾选。
+    """
+    seen = {}
+    out = []
+    for i, c in enumerate(cols, 1):
+        name = "" if pd.isna(c) else str(c).replace('\ufeff', '').replace('\ufffe', '').strip()
+        if not name or name.startswith('Unnamed'):
+            name = f"列{i}"
+        n = seen.get(name, 0) + 1
+        seen[name] = n
+        out.append(name if n == 1 else f"{name}_{n}")
+    return out
+
+
+def pick_header_row(raw, max_scan=20):
+    """自动判断表头行（应对「首行为合并标题」「A1 空置」等情况）：
+    - 首行非空单元格 >= 2：首行即表头
+    - 首行全空：取第一个非空行
+    - 首行仅 1 格（如合并单元格标题）且下一行非空更多：取下一行
+    """
+    if len(raw) == 0:
+        return 0
+    first = raw.iloc[0].notna().sum()
+    if first >= 2:
+        return 0
+    if first == 0:
+        for i in range(min(max_scan, len(raw))):
+            if raw.iloc[i].notna().sum() > 0:
+                return i
+        return 0
+    if len(raw) > 1 and raw.iloc[1].notna().sum() > first:
+        return 1
+    return 0
+
+
+def build_df(raw, header_idx):
+    """按表头行构建正式 DataFrame：清洗列名，删除全空行与全空列。"""
+    if len(raw) == 0:
+        return pd.DataFrame()
+    cols = clean_column_names(raw.iloc[header_idx].tolist())
+    df = raw.iloc[header_idx + 1:].copy()
+    df.columns = cols
+    df = df.dropna(how='all').dropna(axis=1, how='all')
+    return df.reset_index(drop=True)
+
+
+def read_file_raw(uploaded_file, sheet_name=0):
+    """把上传文件读成原始网格(header=None, dtype=str)，不丢空表头信息。
+
+    CSV：自动探测编码(UTF-8/GBK/GB2312/Latin-1)与分隔符(, ; Tab)，
+    异常行跳过（财务导出的脏 CSV 常见）。
+    """
+    name = uploaded_file.name
+    if name.endswith('.csv'):
+        encodings = ['utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'latin-1']
+        for encoding in encodings:
+            try:
+                uploaded_file.seek(0)
+                return pd.read_csv(uploaded_file, encoding=encoding, dtype=str,
+                                   header=None, sep=None, engine='python',
+                                   on_bad_lines='skip')
+            except UnicodeDecodeError:
+                continue
+        return None
+    uploaded_file.seek(0)
+    return pd.read_excel(uploaded_file, dtype=str, header=None, sheet_name=sheet_name)
+
+
 def gen_masked_value(method, val_str):
     """根据脱敏方法生成一个假值（纯函数，便于碰撞时重试）"""
     if method == "姓名":
@@ -167,6 +242,26 @@ def gen_masked_value(method, val_str):
         if val_str.startswith('0') and len(val_str) > len(str(random_num)):
             random_num = str(random_num).zfill(len(val_str))
         return str(random_num)
+    elif method == "金额(保留格式)":
+        # 每个数字段替换为同长度随机数（段首 1-9 防掉位），
+        # 保留负号/千分位/小数点等格式，适合薪资、金额等列
+        def _rand_run(n):
+            if n == 1:
+                return str(get_fake().random_int(min=0, max=9))
+            return str(get_fake().random_int(min=10 ** (n - 1), max=10 ** n - 1))
+        res = []
+        run = 0
+        for ch in val_str:
+            if ch.isdigit():
+                run += 1
+            else:
+                if run:
+                    res.append(_rand_run(run))
+                    run = 0
+                res.append(ch)
+        if run:
+            res.append(_rand_run(run))
+        return "".join(res)
     elif method == "部分遮蔽(保留前3位)":
         if len(val_str) > 3:
             return val_str[:3] + "*" * (len(val_str) - 3)
@@ -182,53 +277,50 @@ def gen_masked_value(method, val_str):
         return val_str
 
 
+def _base_masked_value(method, val_str):
+    """确定性生成脱敏值：同一原值跨文件、跨运行得到同一假值。
+
+    以原值的 SHA-256 摘要作为 Faker 种子，使随机类方法的输出成为原值的
+    纯函数（财务可跨文件对账/汇总）；遮蔽类方法本身由原值结构决定。
+    """
+    seed = int(hashlib.sha256(val_str.encode('utf-8')).hexdigest()[:12], 16)
+    get_fake().seed_instance(seed)
+    return gen_masked_value(method, val_str)
+
+
 def apply_masking(df, col_rules):
     """纯函数：对 df 按 col_rules(列名->方法) 脱敏，返回 (masked_df, mappings)。
 
-    - 所有列以文本处理：源文件用 dtype=str 读入，脱敏列再统一转文本，
-      彻底避免 Excel 把数字型脱敏值（银行卡号/手机号/随机数字等）数值化、
-      科学计数法化，或破坏前导零（如发票号 04403...）与小数格式（如金额 156800.00）。
-    - 随机生成类方法的脱敏值在本列内保证唯一，否则还原时 reverse_map 会互相
-      覆盖导致串档。
+    - 所有列以文本处理：源文件用 dtype=str 读入，避免 Excel 把数字型脱敏值
+      数值化、科学计数法化，或破坏前导零（如发票号 04403...）与小数格式
+      （如金额 156800.00）；空单元格保持为空（不变成字符串 "nan"）。
+    - 确定性：同一原值 -> 同一假值（跨文件/跨运行一致），脱敏可复现。
+    - 列内假值唯一：不同原值绝不映射到同一假值（遮蔽类方法如部分遮蔽/完全
+      遮蔽不同原值可能产生相同结果，统一追加确定性后缀解决），保证还原时
+      reverse_map 不会互相覆盖导致串档。
     """
     masked_df = df.copy()
     mappings = {}
-    RANDOM_METHODS = {
-        "姓名", "身份证号", "手机号", "银行卡号",
-        "地址", "邮箱", "公司名", "自定义文本", "随机数字",
-    }
-
-    def apply_mask(val, method, col_map, used):
-        if pd.isna(val):
-            return val
-        val_str = str(val)
-        if val_str in col_map:
-            return col_map[val_str]
-        new_val = gen_masked_value(method, val_str)
-        if method in RANDOM_METHODS and new_val in used:
-            for _ in range(10):
-                cand = gen_masked_value(method, val_str)
-                if cand not in used:
-                    new_val = cand
-                    break
-            else:
-                n = 2
-                while f"{new_val}#{n}" in used:
-                    n += 1
-                new_val = f"{new_val}#{n}"
-        col_map[val_str] = new_val
-        used.add(new_val)
-        return new_val
 
     for col, method in col_rules.items():
         col_map = {}
-        used = set()
-        masked_df[col] = masked_df[col].apply(
-            lambda x: apply_mask(x, method, col_map, used)
-        )
+        vals = df[col].dropna().astype(str)
+        # 第 1 趟：对每个去重原值生成基准假值（确定性）
+        base_of = {v: _base_masked_value(method, v) for v in vals.unique()}
+        # 第 2 趟：基准假值冲突（不同原值 -> 同一假值）时，按原值追加确定性
+        # 后缀，保证列内唯一且结果与行序无关
+        groups = defaultdict(list)
+        for v, b in base_of.items():
+            groups[b].append(v)
+        for b, vs in groups.items():
+            if len(vs) == 1:
+                col_map[vs[0]] = b
+            else:
+                for v in vs:
+                    tag = hashlib.sha256(f"{col}\x00{v}".encode('utf-8')).hexdigest()[:6]
+                    col_map[v] = f"{b}#{tag}"
+        masked_df[col] = vals.map(col_map)
         mappings[col] = col_map
-    for col in col_rules:
-        masked_df[col] = masked_df[col].astype(str)
     return masked_df, mappings
 
 
@@ -290,6 +382,20 @@ if 'original_filename' not in st.session_state:
     st.session_state.original_filename = ""
 if 'restored_df' not in st.session_state:
     st.session_state.restored_df = None
+if 'loaded_name' not in st.session_state:
+    st.session_state.loaded_name = ""
+if 'raw_df' not in st.session_state:
+    st.session_state.raw_df = None
+if 'raw_sheet' not in st.session_state:
+    st.session_state.raw_sheet = None
+if 'sheet_names' not in st.session_state:
+    st.session_state.sheet_names = []
+if 'sheet_sel' not in st.session_state:
+    st.session_state.sheet_sel = None
+if 'header_row' not in st.session_state:
+    st.session_state.header_row = -1  # -1 = 自动检测
+if 'df_header' not in st.session_state:
+    st.session_state.df_header = None
 
 # ========== 侧边栏：简短说明 ==========
 with st.sidebar:
@@ -322,42 +428,91 @@ with tab1:
     )
 
     if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                encodings = ['utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'latin-1']
-                df = None
-                for encoding in encodings:
-                    try:
-                        uploaded_file.seek(0)
-                        # dtype=str：源文件一律按文本读入，保留前导零(发票号 04403...)
-                        # 与小数格式(金额 156800.00)，避免被数值化后精度/格式损坏。
-                        df = pd.read_csv(uploaded_file, encoding=encoding, dtype=str)
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                if df is None:
+        # 换文件时重置状态：清空旧的脱敏/还原结果，避免串到新文件
+        if st.session_state.loaded_name != uploaded_file.name:
+            st.session_state.loaded_name = uploaded_file.name
+            st.session_state.original_filename = uploaded_file.name
+            st.session_state.raw_df = None
+            st.session_state.raw_sheet = None
+            st.session_state.header_row = -1
+            st.session_state.masked_df = None
+            st.session_state.mappings = {}
+            st.session_state.restored_df = None
+            # Excel 多工作表：列出供选择
+            sheet_names = []
+            if not uploaded_file.name.endswith('.csv'):
+                try:
+                    uploaded_file.seek(0)
+                    sheet_names = pd.ExcelFile(uploaded_file).sheet_names
+                except Exception:
+                    sheet_names = []
+            st.session_state.sheet_names = sheet_names
+            st.session_state.sheet_sel = sheet_names[0] if sheet_names else None
+
+        # Excel 多 Sheet 选择（切换后重新读取对应工作表）
+        if st.session_state.sheet_names:
+            st.session_state.sheet_sel = st.selectbox(
+                "选择工作表",
+                options=st.session_state.sheet_names,
+                index=st.session_state.sheet_names.index(st.session_state.sheet_sel)
+                if st.session_state.sheet_sel in st.session_state.sheet_names else 0,
+                key=f"sheet_sel_{st.session_state.loaded_name}",
+            )
+
+        # 读取原始网格（新文件或切换工作表时）
+        if (st.session_state.raw_df is None
+                or st.session_state.raw_sheet != st.session_state.sheet_sel):
+            try:
+                raw = read_file_raw(uploaded_file, st.session_state.sheet_sel)
+                if raw is None:
                     st.error("无法识别文件编码，请尝试转换为 UTF-8 编码后重新上传")
                     st.info("提示：可以在 Excel 中另存为 CSV 时选择 UTF-8 编码")
+                    st.stop()
+                st.session_state.raw_df = raw
+                st.session_state.raw_sheet = st.session_state.sheet_sel
+            except Exception as e:
+                error_msg = str(e)
+                if "Invalid file" in error_msg or "File is not a zip file" in error_msg:
+                    st.error("文件格式不正确，请确保上传的是有效的 Excel 或 CSV 文件")
+                elif "Permission denied" in error_msg:
+                    st.error("文件被占用，请关闭 Excel 或其他程序后重试")
                 else:
-                        df.columns = [str(c).replace('\ufeff', '').replace('\ufffe', '') for c in df.columns]
-                        st.session_state.df = df
-                        st.session_state.original_filename = uploaded_file.name
-                        st.success(f"✅ 文件加载成功: {uploaded_file.name} ({len(df)} 行, {len(df.columns)} 列)")
-            else:
-                df = pd.read_excel(uploaded_file, dtype=str)
-                df.columns = [str(c).replace('\ufeff', '').replace('\ufffe', '') for c in df.columns]
-                st.session_state.df = df
-                st.session_state.original_filename = uploaded_file.name
-                st.success(f"✅ 文件加载成功: {uploaded_file.name} ({len(df)} 行, {len(df.columns)} 列)")
-        except Exception as e:
-            error_msg = str(e)
-            if "Invalid file" in error_msg or "File is not a zip file" in error_msg:
-                st.error("文件格式不正确，请确保上传的是有效的 Excel 或 CSV 文件")
-            elif "Permission denied" in error_msg:
-                st.error("文件被占用，请关闭 Excel 或其他程序后重试")
-            else:
-                st.error(f"文件读取失败: {e}")
-                st.info("常见解决方案：\n1. 确保文件格式正确\n2. 检查文件是否损坏\n3. 尝试重新保存文件")
+                    st.error(f"文件读取失败: {e}")
+                    st.info("常见解决方案：\n1. 确保文件格式正确\n2. 检查文件是否损坏\n3. 尝试重新保存文件")
+                st.stop()
+
+        raw = st.session_state.raw_df
+
+        # 表头行：默认自动检测，可手动指定（如首行为合并标题时）
+        max_header = min(10, len(raw))
+        hdr_opts = ["自动检测"] + [f"第{i}行" for i in range(1, max_header + 1)]
+        hdr_idx = 0 if st.session_state.header_row < 0 else min(st.session_state.header_row, len(hdr_opts) - 1)
+        hdr_sel = st.selectbox(
+            "表头所在行",
+            options=hdr_opts,
+            index=hdr_idx,
+            key=f"hdr_sel_{st.session_state.loaded_name}",
+            help="系统已自动判断表头行；若首行是合并标题等，可手动指定"
+        )
+        if hdr_sel == "自动检测":
+            st.session_state.header_row = -1
+            header_idx = pick_header_row(raw)
+        else:
+            header_idx = int(hdr_sel.replace("第", "").replace("行", "")) - 1
+            st.session_state.header_row = header_idx
+
+        df = build_df(raw, header_idx)
+        if len(df) == 0:
+            st.error("文件没有有效数据：表头下没有任何非空数据行")
+            st.stop()
+        # 表头/工作表变化会重建 df：同步清空旧的脱敏/还原结果，避免列错位
+        if st.session_state.get('df_header') != header_idx:
+            st.session_state.df_header = header_idx
+            st.session_state.masked_df = None
+            st.session_state.mappings = {}
+            st.session_state.restored_df = None
+        st.session_state.df = df
+        st.success(f"✅ 文件加载成功: {uploaded_file.name} ({len(df)} 行, {len(df.columns)} 列)")
 
     if st.session_state.df is not None:
         df = st.session_state.df
@@ -456,7 +611,7 @@ with tab2:
 
                         total_values = sum(len(v) for v in mappings.values())
                         st.success(
-                            f"✅ 脱敏完成！分类：{eff_cat}　共处理 {total_cols} 列, "
+                            f"✅ 脱敏完成！分类：{eff_cat}　共处理 {len(col_rules)} 列, "
                             f"{total_values} 个唯一值"
                         )
                     except Exception as e:
@@ -560,13 +715,13 @@ with tab4:
     st.subheader("🔄 拖入文件，一键还原")
     st.markdown("""
     将 **脱敏后的文件** 与 **映射表** 分别拖入下方，点击「一键还原」即可恢复原始数据。
-    - 脱敏后文件：`.xlsx`（即「导出 & 映射表」里下载的脱敏后文件）
+    - 脱敏后文件：`.xlsx` / `.csv`（即「导出 & 映射表」里下载的脱敏后文件）
     - 映射表：`.json`（明文）或 `.bin`（加密，需密码）
     """)
 
     restore_masked = st.file_uploader(
-        "① 拖入脱敏后的文件 (.xlsx / .xls)",
-        type=['xlsx', 'xls'],
+        "① 拖入脱敏后的文件 (.xlsx / .xls / .csv)",
+        type=['xlsx', 'xls', 'csv'],
         key="restore_masked"
     )
     restore_mapping = st.file_uploader(
@@ -617,7 +772,21 @@ with tab4:
                 else:
                     mappings = obj
 
-                masked_df = pd.read_excel(restore_masked, dtype=str)
+                masked_df = None
+                if restore_masked.name.endswith('.csv'):
+                    encodings = ['utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'latin-1']
+                    for encoding in encodings:
+                        try:
+                            restore_masked.seek(0)
+                            masked_df = pd.read_csv(restore_masked, encoding=encoding, dtype=str)
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    if masked_df is None:
+                        st.error("无法识别 CSV 编码，请转换为 UTF-8 后重试")
+                        st.stop()
+                else:
+                    masked_df = pd.read_excel(restore_masked, dtype=str)
                 masked_df, restored_count = restore_with_mapping(masked_df, mappings)
 
                 st.session_state.restored_df = masked_df
